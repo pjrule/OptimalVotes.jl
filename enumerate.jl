@@ -8,24 +8,22 @@ using Distributed
     max_share::Float64
     min_voters::Set{Array{Int}}
     max_voters::Set{Array{Int}}
-    id::Int
-    hash::UInt
+    voters_hash::UInt64
 end
 include("./dedupe.jl")
 
-const batch_size = 10000
-const channel_size = 1 #16384
+const batch_size = 250000
+const channel_size = 1
 const n_voters = 12
 
 @everywhere function eval_voter_dists(jobs, results)
     while true
         voter_dists = take!(jobs)
-        println("got block of size ", size(voter_dists, 2))
         max_share = 0
         min_share = 1
         max_voters = Set([])
         min_voters = Set([])
-        voter_hash = hash(Set(voter_dists[:, i] for i in 1:size(voter_dists, 2)))
+        v_hash = hash(Set(v for v in eachcol(voter_dists)))
         for i in 1:size(voter_dists, 2)
             voters = voter_dists[:, i]
             share = expected_seat_share(voters)
@@ -42,47 +40,35 @@ const n_voters = 12
                 push!(min_voters, voters)
             end
         end
-        extremes = Extremes(min_share, max_share, min_voters, max_voters, rand(Int), voter_hash)
-        println("putting extremes with min_share: ", min_share, "\tmax_share: ", max_share)
+        extremes = Extremes(min_share, max_share, min_voters, max_voters)#, v_hash)
         put!(results, extremes)
     end
 end
 
-function add_combos(jobs::RemoteChannel, batch_size::Int, n_voters::Int)
+function add_combos(jobs::RemoteChannel, meta::RemoteChannel, batch_size::Int, n_voters::Int)
     batch_count = 0
     batch_idx = 1
     batch = zeros(Int, n_voters, batch_size)
     for c in combinations(1:ensemble.size, n_voters)
-        if !combo_duplicated(c, minimum(c), ensemble.width)
+        if !combo_duplicated(c, ensemble.width)
             batch[:, batch_idx] = c
-            if batch_idx == 10
-                println("tenth combo is ", c)
-                println("first ten:")
-                println(batch[:, 1:10]')
-            end
             batch_idx += 1
             if batch_idx > batch_size
-                println("putting batch ", batch_count)
-                put!(jobs, batch)
-                println("put batch ", batch_count)
-                voter_hash = hash(Set(batch[:, i] for i in 1:size(batch, 2)))
-                println("putting vote dists with set hash ", voter_hash)
+                put!(jobs, copy(batch))
                 batch_idx = 1
                 batch_count += 1 
-            end
-            if batch_count == 21
-                break
             end
         end
     end
     # Handle remaining partial batch
-    put!(jobs, batch[:, 1:batch_idx - 1])
+    put!(jobs, copy(batch[:, 1:batch_idx - 1]))
     batch_count += 1
-    batch_count
+    put!(meta, batch_count)
 end
 
 function main()
     jobs = RemoteChannel(()->Channel{Array{Int, 2}}(channel_size))
+    meta = RemoteChannel(()->Channel{Int}(1))
     results = RemoteChannel(()->Channel{Extremes}(channel_size))
     # Start workers.
     for p in workers()
@@ -93,15 +79,15 @@ function main()
     min_share = 1
     max_voters = Set([])
     min_voters = Set([])
-    @async add_combos(jobs, batch_size, n_voters)
-    #add_combos(jobs, batch_size, n_voters)
-    for i in 1:20
+    @async add_combos(jobs, meta, batch_size, n_voters)
+    i = 0
+    n_batches = missing
+    while true
         batch_extremes = take!(results)
         println("[batch ", i, "]")
         println("\tmin share: ", batch_extremes.min_share)
         println("\tmax share: ", batch_extremes.max_share)
-        println("\trandom result ID: ", batch_extremes.id)
-        println("\tvoter dist hash:  ", batch_extremes.hash)
+        println("\tvoters hash: ", batch_extremes.voters_hash)
         println("\tmin voter dists:")
         for v in batch_extremes.min_voters
             println("\t\t", v)
@@ -123,6 +109,14 @@ function main()
         elseif batch_extremes.max_share == max_share
             max_voters = union(max_voters, batch_extremes.max_voters)
         end
+        i += 1
+       if isready(meta)
+            n_batches = take!(meta)
+            println("got number of batches: ", n_batches)
+        end
+        if !ismissing(n_batches) && n_batches == i
+            break  # done!
+        end
     end
     println("min share: ", min_share)
     println("max share: ", max_share)
@@ -134,7 +128,6 @@ function main()
     for v in max_voters
         println(v)
     end
-    println(max_voters)
 
     # Kill workers.
     for wid in workers()
